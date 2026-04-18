@@ -1,6 +1,8 @@
 import fsp from 'node:fs/promises';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type {
@@ -12,7 +14,7 @@ import type {
   Verdict,
 } from './types.js';
 import { shadowModeNote } from './safety.js';
-import { formatMs } from './util.js';
+import { formatMs, escHtml } from './util.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -27,6 +29,9 @@ const VERDICT_ICON: Record<Verdict, string> = {
 
 // ─── PR creation ──────────────────────────────────────────────────────────────
 
+// owner/repo — only alphanumeric, hyphen, underscore, dot, forward slash
+const REPO_RE = /^[a-zA-Z0-9_.\-]+\/[a-zA-Z0-9_.\-]+$/;
+
 export async function createPr(
   theme: ResolvedTheme,
   ctx: RunContext,
@@ -39,6 +44,11 @@ export async function createPr(
     return undefined;
   }
 
+  if (!REPO_RE.test(theme.repo)) {
+    console.warn(`[report] Invalid repo format "${theme.repo}" — skipping PR creation.`);
+    return undefined;
+  }
+
   const branch = `theme-doctor/${ctx.runId}`;
   const failingVerdicts = judgement.verdicts.filter(v => v.verdict !== 'pass');
 
@@ -48,15 +58,20 @@ export async function createPr(
 
   const body = buildPrBody(theme, ctx, patch, judgement, shadowMode);
 
+  // Bug fix: pass PR body via --body-file to avoid OS argument length limits
+  // (PR bodies can be large; Linux ARG_MAX is ~128KB, macOS ~2MB)
+  const uid = crypto.randomBytes(6).toString('hex');
+  const bodyFile = path.join(os.tmpdir(), `td-pr-body-${uid}.txt`);
   try {
-    // Create branch and commit in theme's local path
+    await fsp.writeFile(bodyFile, body, 'utf8');
+
     const { stdout } = await execFileAsync('gh', [
       'pr', 'create',
       '--repo', theme.repo,
       '--head', branch,
       '--base', theme.branch,
       '--title', title,
-      '--body', body,
+      '--body-file', bodyFile,
       ...(shadowMode ? ['--draft'] : []),
     ], { cwd: theme.localPath });
 
@@ -65,6 +80,8 @@ export async function createPr(
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[report] PR creation failed for "${theme.id}": ${msg}`);
     return undefined;
+  } finally {
+    await fsp.unlink(bodyFile).catch(() => undefined);
   }
 }
 
@@ -203,28 +220,34 @@ export async function writeHtmlReport(
   const avgDuration = totalRuns > 0 ? Math.round(reports.reduce((s, r) => s + r.durationMs, 0) / totalRuns) : 0;
   const totalCost  = reports.reduce((s, r) => s + r.costUsd, 0);
 
+  // Pass 17: escape all user-controlled strings before embedding in HTML
   const cards = [...latestByTheme.values()].map(r => {
-    const icon       = VERDICT_ICON[r.verdict];
-    const issues     = r.judgements.filter(j => j.verdict !== 'pass').length;
-    const history    = historyByTheme.get(r.themeId) ?? [r.verdict];
-    const sparkline  = sparklineSvg(history);
-    const matrixStr  = `WP ${r.matrix.wp} · WC ${r.matrix.wc} · PHP ${r.matrix.php}`;
+    const icon      = VERDICT_ICON[r.verdict];    // safe: from a controlled enum
+    const verdict   = escHtml(r.verdict);          // enum but escape for safety
+    const themeId   = escHtml(r.themeId);
+    const issues    = r.judgements.filter(j => j.verdict !== 'pass').length;
+    const history   = historyByTheme.get(r.themeId) ?? [r.verdict];
+    const sparkline = sparklineSvg(history);
+    const matrixStr = `WP ${escHtml(r.matrix.wp)} · WC ${escHtml(r.matrix.wc)} · PHP ${escHtml(r.matrix.php)}`;
+    // prUrl: validate it's a real GitHub URL before rendering as <a>
+    const safePrUrl = r.prUrl && /^https:\/\/github\.com\/[a-zA-Z0-9_.\-]+\/[a-zA-Z0-9_.\-]+\/pull\/\d+$/.test(r.prUrl)
+      ? r.prUrl : null;
     return `
-    <div class="card verdict-${r.verdict}">
+    <div class="card verdict-${verdict}">
       <div class="card-header">
         <span class="verdict-icon">${icon}</span>
-        <span class="theme-name">${r.themeId}</span>
-        <span class="verdict-badge ${r.verdict}">${r.verdict}</span>
+        <span class="theme-name">${themeId}</span>
+        <span class="verdict-badge ${verdict}">${verdict}</span>
       </div>
       <div class="card-body">
         <div class="matrix">${matrixStr}</div>
-        <div class="issues">${issues > 0 ? `${issues} issue${issues !== 1 ? 's' : ''}` : 'No issues'}</div>
+        <div class="issues">${issues > 0 ? `${escHtml(String(issues))} issue${issues !== 1 ? 's' : ''}` : 'No issues'}</div>
         <div class="sparkline">${sparkline}</div>
       </div>
       <div class="card-footer">
-        <span class="duration">${formatMs(r.durationMs)}</span>
-        ${r.prUrl ? `<a href="${r.prUrl}" target="_blank" class="pr-link">View PR →</a>` : ''}
-        <span class="run-at">${new Date(r.createdAt).toLocaleDateString()}</span>
+        <span class="duration">${escHtml(formatMs(r.durationMs))}</span>
+        ${safePrUrl ? `<a href="${escHtml(safePrUrl)}" target="_blank" rel="noopener noreferrer" class="pr-link">View PR →</a>` : ''}
+        <span class="run-at">${escHtml(new Date(r.createdAt).toLocaleDateString())}</span>
       </div>
     </div>`;
   }).join('\n');
@@ -368,22 +391,34 @@ export async function writeDashboardJson(
 
 // ─── Static dashboard builder ─────────────────────────────────────────────────
 
+const MAX_DASHBOARD_RUNS = 500; // prevent runaway scans
+
 export async function buildDashboard(configDir: string): Promise<string> {
-  const reportsDir  = path.join(configDir, 'reports');
-  const dashDir     = path.join(reportsDir, 'dashboard');
+  const reportsDir = path.join(configDir, 'reports');
+  const dashDir    = path.join(reportsDir, 'dashboard');
   const allReports: ThemeRunReport[] = [];
 
   if (fs.existsSync(reportsDir)) {
-    const runDirs = await fsp.readdir(reportsDir);
-    for (const runId of runDirs) {
-      if (runId === 'dashboard') continue;
+    let runDirs = await fsp.readdir(reportsDir);
+    // Sort descending by name (ISO timestamps sort correctly) and cap
+    runDirs = runDirs
+      .filter(d => d !== 'dashboard')
+      .sort((a, b) => b.localeCompare(a))
+      .slice(0, MAX_DASHBOARD_RUNS);
+
+    await Promise.all(runDirs.map(async (runId) => {
+      // Only allow safe directory names (same rule as runId)
+      if (!/^[a-zA-Z0-9_\-]+$/.test(runId)) return;
       const reportPath = path.join(reportsDir, runId, 'report.json');
-      if (fs.existsSync(reportPath)) {
+      try {
+        await fsp.access(reportPath);
         const data = JSON.parse(await fsp.readFile(reportPath, 'utf8'));
-        if (Array.isArray(data)) allReports.push(...data);
+        if (Array.isArray(data)) allReports.push(...(data as ThemeRunReport[]));
         else allReports.push(data as ThemeRunReport);
+      } catch {
+        // Skip corrupted or missing report files
       }
-    }
+    }));
   }
 
   await writeHtmlReport(allReports, dashDir);
@@ -397,6 +432,14 @@ export async function notifySlack(
   webhookUrl: string,
   reports: ThemeRunReport[],
 ): Promise<void> {
+  // Bug fix: validate that the webhook URL is actually a Slack URL before posting
+  // This prevents accidental or malicious config values from posting to arbitrary hosts
+  const SLACK_WEBHOOK_RE = /^https:\/\/hooks\.slack\.com\/services\/[A-Z0-9\/]+$/i;
+  if (!SLACK_WEBHOOK_RE.test(webhookUrl)) {
+    console.warn(`[report] notifySlack: invalid or non-Slack webhook URL — skipping notification.`);
+    return;
+  }
+
   const failing = reports.filter(r => r.verdict !== 'pass');
   if (failing.length === 0) return;
 

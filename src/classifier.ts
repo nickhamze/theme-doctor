@@ -1,7 +1,10 @@
-import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import type { ThemeClassification, ThemeType } from './types.js';
+
+async function exists(p: string): Promise<boolean> {
+  return fsp.access(p).then(() => true).catch(() => false);
+}
 
 // ─── style.css header parser ─────────────────────────────────────────────────
 
@@ -18,7 +21,7 @@ function parseStyleHeader(content: string): Record<string, string> {
 
 async function checkHposAware(themeDir: string): Promise<boolean> {
   const functionsPath = path.join(themeDir, 'functions.php');
-  if (!fs.existsSync(functionsPath)) return false;
+  if (!(await exists(functionsPath))) return false;
   const content = await fsp.readFile(functionsPath, 'utf8');
   return content.includes('woocommerce_hpos_enabled') ||
     content.includes('CustomOrdersTableController') ||
@@ -32,24 +35,27 @@ async function checkHposAware(themeDir: string): Promise<boolean> {
 async function detectCheckoutType(
   themeDir: string,
 ): Promise<'shortcode' | 'block' | 'unknown'> {
-  // Check for block-checkout page template
   const tplDirs = ['templates', 'block-templates', 'parts'];
   for (const dir of tplDirs) {
     const tplDir = path.join(themeDir, dir);
-    if (!fs.existsSync(tplDir)) continue;
-    const files = await fsp.readdir(tplDir);
+    if (!(await exists(tplDir))) continue;
+    let files: string[];
+    try {
+      files = await fsp.readdir(tplDir);
+    } catch { continue; }
     for (const f of files) {
       if (f.includes('checkout') && (f.endsWith('.html') || f.endsWith('.php'))) {
-        const content = await fsp.readFile(path.join(tplDir, f), 'utf8');
-        if (content.includes('woocommerce/checkout') || content.includes('wp:woocommerce/checkout')) {
-          return 'block';
-        }
+        try {
+          const content = await fsp.readFile(path.join(tplDir, f), 'utf8');
+          if (content.includes('woocommerce/checkout') || content.includes('wp:woocommerce/checkout')) {
+            return 'block';
+          }
+        } catch { /* skip unreadable files */ }
       }
     }
   }
-  // Check functions.php for shortcode
   const fnPath = path.join(themeDir, 'functions.php');
-  if (fs.existsSync(fnPath)) {
+  if (await exists(fnPath)) {
     const content = await fsp.readFile(fnPath, 'utf8');
     if (content.includes('[woocommerce_checkout]') || content.includes('woocommerce_checkout')) {
       return 'shortcode';
@@ -62,18 +68,24 @@ async function detectCheckoutType(
 
 async function detectThemeType(themeDir: string): Promise<ThemeType> {
   const themeJsonPath = path.join(themeDir, 'theme.json');
-  if (!fs.existsSync(themeJsonPath)) return 'classic';
+  if (!(await exists(themeJsonPath))) return 'classic';
 
-  const themeJson = JSON.parse(await fsp.readFile(themeJsonPath, 'utf8'));
+  // Bug fix: JSON.parse wrapped in try/catch — malformed theme.json must not crash
+  let themeJson: unknown = null;
+  try {
+    themeJson = JSON.parse(await fsp.readFile(themeJsonPath, 'utf8'));
+  } catch {
+    // Malformed theme.json — treat as classic theme
+    return 'classic';
+  }
 
   // FSE if it has a templates directory with block templates
   const templatesDirs = ['templates', 'block-templates'];
   for (const dir of templatesDirs) {
     const p = path.join(themeDir, dir);
-    if (fs.existsSync(p)) {
-      const files = await fsp.readdir(p);
-      const htmlFiles = files.filter(f => f.endsWith('.html'));
-      if (htmlFiles.length > 0) return 'fse';
+    if (await exists(p)) {
+      const files = await fsp.readdir(p).catch(() => [] as string[]);
+      if (files.some(f => f.endsWith('.html'))) return 'fse';
     }
   }
 
@@ -89,8 +101,8 @@ async function listBlockTemplates(themeDir: string): Promise<string[]> {
   const results: string[] = [];
   for (const dir of dirs) {
     const p = path.join(themeDir, dir);
-    if (!fs.existsSync(p)) continue;
-    const files = await fsp.readdir(p);
+    if (!(await exists(p))) continue;
+    const files = await fsp.readdir(p).catch(() => [] as string[]);
     results.push(...files.filter(f => f.endsWith('.html')).map(f => `${dir}/${f}`));
   }
   return results;
@@ -101,8 +113,8 @@ async function listBlockParts(themeDir: string): Promise<string[]> {
   const results: string[] = [];
   for (const dir of dirs) {
     const p = path.join(themeDir, dir);
-    if (!fs.existsSync(p)) continue;
-    const files = await fsp.readdir(p);
+    if (!(await exists(p))) continue;
+    const files = await fsp.readdir(p).catch(() => [] as string[]);
     results.push(...files.filter(f => f.endsWith('.html')).map(f => `${dir}/${f}`));
   }
   return results;
@@ -116,7 +128,8 @@ async function hasCustomProductTemplate(themeDir: string): Promise<boolean> {
     'woocommerce/content-single-product.php',
     'woocommerce/archive-product.php',
   ];
-  return candidates.some(c => fs.existsSync(path.join(themeDir, c)));
+  const checks = await Promise.all(candidates.map(c => exists(path.join(themeDir, c))));
+  return checks.some(Boolean);
 }
 
 // ─── Main classifier ──────────────────────────────────────────────────────────
@@ -124,7 +137,7 @@ async function hasCustomProductTemplate(themeDir: string): Promise<boolean> {
 export async function classifyTheme(themeDir: string): Promise<ThemeClassification> {
   const styleCssPath = path.join(themeDir, 'style.css');
   let header: Record<string, string> = {};
-  if (fs.existsSync(styleCssPath)) {
+  if (await exists(styleCssPath)) {
     const content = await fsp.readFile(styleCssPath, 'utf8');
     header = parseStyleHeader(content);
   }

@@ -4,6 +4,16 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import Anthropic from '@anthropic-ai/sdk';
+import { z } from 'zod';
+import { sanitizeId } from './safety.js';
+
+// Pass 9 + 19: Zod schema for LLM judge response
+const LlmVerdictSchema = z.object({
+  verdict:           z.enum(['pass', 'cosmetic', 'layout', 'functional']),
+  confidence:        z.number().min(0).max(1),
+  evidence:          z.array(z.string().max(500)).max(20),
+  suggested_fix_hint: z.string().max(500).optional(),
+});
 import type {
   EvidencePacket,
   EvidenceCapture,
@@ -19,15 +29,23 @@ const execFileAsync = promisify(execFile);
 // ─── Golden paths ─────────────────────────────────────────────────────────────
 
 export function goldenDir(configDir: string, themeId: string, wp: string, wc: string): string {
-  return path.join(configDir, 'goldens', themeId, `${wp}-${wc}`);
+  // Sanitize all user-controlled path segments
+  const safeWp  = wp.replace(/[^a-zA-Z0-9.\-]/g, '_').slice(0, 32);
+  const safeWc  = wc.replace(/[^a-zA-Z0-9.\-]/g, '_').slice(0, 32);
+  return path.join(configDir, 'goldens', sanitizeId(themeId), `${safeWp}-${safeWc}`);
+}
+
+// Sanitize template/flow IDs for use in filenames — defense-in-depth beyond Zod rubric validation
+function safeTemplateId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 64) || 'unknown';
 }
 
 export function goldenScreenshotPath(dir: string, templateId: string, viewport: Viewport): string {
-  return path.join(dir, `${templateId}-${viewport}.png`);
+  return path.join(dir, `${safeTemplateId(templateId)}-${viewport}.png`);
 }
 
 export function goldenSignaturePath(dir: string, templateId: string, viewport: Viewport): string {
-  return path.join(dir, `${templateId}-${viewport}.sig`);
+  return path.join(dir, `${safeTemplateId(templateId)}-${viewport}.sig`);
 }
 
 // ─── Tier 1: Rubric assertions ────────────────────────────────────────────────
@@ -89,8 +107,18 @@ async function judgePixelDiff(
   capture: EvidenceCapture,
   gDir: string,
 ): Promise<{ verdict: Verdict; evidence: string[]; diffPath?: string; diffPct?: number } | null> {
+  // Bug fix: if the capture failed (empty path), there's nothing to diff
+  if (!capture.screenshotPath) return null;
+
   const goldenPath = goldenScreenshotPath(gDir, capture.templateId, capture.viewport);
   if (!fs.existsSync(goldenPath)) return null;
+
+  // Also verify the capture screenshot actually exists on disk
+  try {
+    await fsp.access(capture.screenshotPath);
+  } catch {
+    return null;
+  }
 
   const diffPath = capture.screenshotPath.replace('.png', '-diff.png');
 
@@ -121,12 +149,7 @@ async function judgePixelDiff(
 
 // ─── Tier 4: LLM judge ───────────────────────────────────────────────────────
 
-interface LlmVerdict {
-  verdict:          Verdict;
-  confidence:       number;
-  evidence:         string[];
-  suggested_fix_hint?: string;
-}
+type LlmVerdict = z.infer<typeof LlmVerdictSchema>;
 
 async function judgeLlm(
   capture: EvidenceCapture,
@@ -143,29 +166,43 @@ async function judgeLlm(
     };
   }
 
-  const client = new Anthropic({ apiKey });
+  const client = new Anthropic({ apiKey, maxRetries: 2, timeout: 65_000 });
   const template = rubric.templates.find(t => t.id === capture.templateId);
 
-  const screenContent = fs.existsSync(capture.screenshotPath)
+  // Pass 9: only read files that exist AND are non-empty PNGs
+  const isValidPng = async (p: string): Promise<boolean> => {
+    try {
+      const buf = await fsp.readFile(p);
+      // PNG magic bytes: 89 50 4E 47 0D 0A 1A 0A
+      return buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47;
+    } catch { return false; }
+  };
+
+  const screenContent = (await isValidPng(capture.screenshotPath))
     ? await fsp.readFile(capture.screenshotPath)
     : null;
 
   const goldenPath = goldenScreenshotPath(goldenDir, capture.templateId, capture.viewport);
-  const goldenContent = fs.existsSync(goldenPath)
+  const goldenContent = (await isValidPng(goldenPath))
     ? await fsp.readFile(goldenPath)
     : null;
 
+  // Pass 21: cap image size sent to LLM (5MB max each to stay within API limits)
+  const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+  const screenToSend = screenContent && screenContent.length <= MAX_IMAGE_BYTES ? screenContent : null;
+  const goldenToSend = goldenContent && goldenContent.length <= MAX_IMAGE_BYTES ? goldenContent : null;
+
   const imageContent: Anthropic.ImageBlockParam[] = [];
-  if (screenContent) {
+  if (screenToSend) {
     imageContent.push({
       type: 'image',
-      source: { type: 'base64', media_type: 'image/png', data: screenContent.toString('base64') },
+      source: { type: 'base64', media_type: 'image/png', data: screenToSend.toString('base64') },
     });
   }
-  if (goldenContent) {
+  if (goldenToSend) {
     imageContent.push({
       type: 'image',
-      source: { type: 'base64', media_type: 'image/png', data: goldenContent.toString('base64') },
+      source: { type: 'base64', media_type: 'image/png', data: goldenToSend.toString('base64') },
     });
   }
 
@@ -187,26 +224,35 @@ Verdicts:
     imageContent.length === 2 ? 'First image = current, second image = golden baseline.' : '',
   ].filter(Boolean).join('\n');
 
-  const msg = await client.messages.create({
-    model:      'claude-haiku-4-5',
-    max_tokens: 512,
-    temperature: 0.1,
-    system:     systemPrompt,
-    messages: [
-      {
-        role:    'user',
-        content: [
-          ...imageContent,
-          { type: 'text', text: userText },
-        ],
-      },
-    ],
-  });
+  const msg = await Promise.race([
+    client.messages.create({
+      model:      'claude-haiku-4-5',
+      max_tokens: 512,
+      temperature: 0.1,
+      system:     systemPrompt,
+      messages: [
+        {
+          role:    'user',
+          content: [
+            ...imageContent,
+            { type: 'text', text: userText },
+          ],
+        },
+      ],
+    }),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Judge LLM timeout (60s)')), 60_000),
+    ),
+  ]);
 
   try {
     const text = msg.content.find(b => b.type === 'text')?.text ?? '{}';
     const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) return JSON.parse(jsonMatch[0]) as LlmVerdict;
+    if (jsonMatch) {
+      const raw = JSON.parse(jsonMatch[0]);
+      const validated = LlmVerdictSchema.safeParse(raw);
+      if (validated.success) return validated.data;
+    }
   } catch { /* fall through */ }
 
   return { verdict: 'pass', confidence: 0.5, evidence: ['LLM response parse error'] };
@@ -358,7 +404,11 @@ export async function goldensExist(
   wc: string,
 ): Promise<boolean> {
   const gDir = goldenDir(configDir, themeId, wp, wc);
-  if (!fs.existsSync(gDir)) return false;
+  try {
+    await fsp.access(gDir);
+  } catch {
+    return false;
+  }
   const files = await fsp.readdir(gDir);
   return files.length > 0;
 }

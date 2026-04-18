@@ -1,7 +1,25 @@
 import crypto from 'node:crypto';
 import fsp from 'node:fs/promises';
-import fs from 'node:fs';
 import path from 'node:path';
+import pLimit from 'p-limit';
+import { atomicWriteFile } from './util.js';
+
+// Pass 20: per-theme serialization lock for circuit breaker and golden bootstrap
+// This prevents TOCTOU races when multiple matrix cells run in parallel for the same theme
+const _themeSerialLocks = new Map<string, Promise<void>>();
+
+function withThemeLock<T>(themeId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = _themeSerialLocks.get(themeId) ?? Promise.resolve();
+  let resolveLock!: () => void;
+  const lock = new Promise<void>(r => { resolveLock = r; });
+  _themeSerialLocks.set(themeId, lock);
+
+  return prev.then(() => fn()).finally(() => {
+    resolveLock();
+    // Clean up map entry if this was the last waiter
+    if (_themeSerialLocks.get(themeId) === lock) _themeSerialLocks.delete(themeId);
+  });
+}
 import { nanoid } from './util.js';
 import type {
   ResolvedTheme,
@@ -45,7 +63,12 @@ function cacheKeyFor(
 }
 
 async function blueprintSha(blueprintPath: string): Promise<string> {
-  if (!fs.existsSync(blueprintPath)) return 'none';
+  // Bug fix: use async fsp.access instead of sync fs.existsSync
+  try {
+    await fsp.access(blueprintPath);
+  } catch {
+    return 'none';
+  }
   const content = await fsp.readFile(blueprintPath);
   return crypto.createHash('sha256').update(content).digest('hex').slice(0, 16);
 }
@@ -56,15 +79,24 @@ function cacheFile(configDir: string, key: string): string {
 
 async function isCacheHit(configDir: string, key: string): Promise<boolean> {
   const f = cacheFile(configDir, key);
-  if (!fs.existsSync(f)) return false;
-  const data = JSON.parse(await fsp.readFile(f, 'utf8'));
-  return data.verdict === 'pass';
+  try {
+    await fsp.access(f);
+  } catch {
+    return false;
+  }
+  try {
+    const data = JSON.parse(await fsp.readFile(f, 'utf8'));
+    return data.verdict === 'pass';
+  } catch {
+    // Corrupted cache entry — treat as miss
+    return false;
+  }
 }
 
 async function writeCacheEntry(configDir: string, key: string, verdict: string): Promise<void> {
   const f = cacheFile(configDir, key);
-  await fsp.mkdir(path.dirname(f), { recursive: true });
-  await fsp.writeFile(f, JSON.stringify({ verdict, ts: new Date().toISOString() }));
+  // Pass 13: atomic write
+  await atomicWriteFile(f, JSON.stringify({ verdict, ts: new Date().toISOString() }));
 }
 
 // ─── Run a single theme × matrix cell ────────────────────────────────────────
@@ -106,14 +138,18 @@ export async function runThemeCell(
   const workDir = path.join(opts.configDir, '.theme-doctor', 'work', runId);
   await fsp.mkdir(workDir, { recursive: true });
 
+  // Pass 25: respect per-theme sandbox preference, then CLI override, then auto-detect
+  const effectiveSandbox =
+    opts.sandbox === 'playground' || opts.sandbox === 'wp-env' ? opts.sandbox
+    : theme.sandbox === 'playground' || theme.sandbox === 'wp-env' ? theme.sandbox
+    : 'playground'; // default to playground
+
   const ctx: RunContext = {
     runId,
     themeId:    theme.id,
     theme,
     matrix:     matrixCell,
-    sandbox:    opts.sandbox === 'playground' || opts.sandbox === 'wp-env'
-      ? opts.sandbox
-      : 'playground',
+    sandbox:    effectiveSandbox,
     configDir:  opts.configDir,
     workDir,
     dryRun:     opts.dryRun,
@@ -127,10 +163,19 @@ export async function runThemeCell(
     workDir,
   };
 
-  const sandbox = await createSandbox(theme, matrixCell, sandboxOpts);
-  const boot = await sandbox.boot(theme, matrixCell);
+  const sandbox = await createSandbox(theme, matrixCell, sandboxOpts, effectiveSandbox);
 
-  let report: ThemeRunReport;
+  // Boot sandbox — if this throws, there is nothing to shut down
+  let boot;
+  try {
+    boot = await sandbox.boot(theme, matrixCell);
+  } catch (err) {
+    await fsp.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+    throw err;
+  }
+
+  // Ensure boot is shut down on ALL exit paths (early return or throw)
+  let report: ThemeRunReport | undefined;
 
   try {
     const rubric = await loadRubric(opts.configDir);
@@ -138,10 +183,10 @@ export async function runThemeCell(
     // Crawl
     const packet = await crawlTheme(ctx, boot, rubric, theme.viewports);
 
-    // Bootstrap goldens if first run
+    // Pass 20: golden bootstrap serialized per-theme to avoid double-bootstrap race
     const hasGoldens = await goldensExist(opts.configDir, theme.id, matrixCell.wp, matrixCell.wc);
     if (!hasGoldens) {
-      await bootstrapGoldens(packet, opts.configDir);
+      await withThemeLock(theme.id, () => bootstrapGoldens(packet, opts.configDir));
       report = {
         runId,
         themeId:    theme.id,
@@ -197,10 +242,11 @@ export async function runThemeCell(
 
     const finalVerdict = latestJudgement.overallVerdict;
 
+    // Pass 20: serialize circuit breaker updates per theme to prevent TOCTOU
     if (finalVerdict !== 'pass') {
-      await recordFailure(opts.configDir, theme.id);
+      await withThemeLock(theme.id, () => recordFailure(opts.configDir, theme.id));
     } else {
-      await recordSuccess(opts.configDir, theme.id);
+      await withThemeLock(theme.id, () => recordSuccess(opts.configDir, theme.id));
       await tagLastKnownGood(theme.localPath, theme.id);
     }
 
@@ -228,45 +274,56 @@ export async function runThemeCell(
     }
 
   } finally {
-    await boot.shutdown();
+    await boot.shutdown().catch(() => undefined);
     await fsp.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  if (!report) {
+    throw new Error(`[orchestrator] report was never assigned for theme "${theme.id}" — this is a bug`);
   }
 
   return report;
 }
 
-// ─── Run all themes × all matrix cells ────────────────────────────────────────
+// ─── Run all themes × all matrix cells (parallel with concurrency cap) ────────
+
+const DEFAULT_CONCURRENCY = 4; // sandbox processes per host
 
 export async function runAll(
   themes: ResolvedTheme[],
-  opts: RunOptions,
+  opts: RunOptions & { concurrency?: number },
 ): Promise<ThemeRunReport[]> {
-  const reports: ThemeRunReport[] = [];
+  const limit = pLimit(opts.concurrency ?? DEFAULT_CONCURRENCY);
+
+  const tasks: Array<Promise<ThemeRunReport>> = [];
 
   for (const theme of themes) {
     const cells = expandMatrix(theme.matrix);
     for (const cell of cells) {
-      try {
-        const report = await runThemeCell(theme, cell, opts);
-        reports.push(report);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[${theme.id}] Error: ${msg}`);
-        reports.push({
-          runId:     'error',
-          themeId:   theme.id,
-          matrix:    cell,
-          verdict:   'functional',
-          judgements: [],
-          durationMs: 0,
-          costUsd:   0,
-          createdAt: new Date().toISOString(),
-        });
-      }
+      tasks.push(
+        limit(async () => {
+          try {
+            return await runThemeCell(theme, cell, opts);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[${theme.id}] Error: ${msg}`);
+            return {
+              runId:      'error',
+              themeId:    theme.id,
+              matrix:     cell,
+              verdict:    'functional' as const,
+              judgements: [],
+              durationMs: 0,
+              costUsd:    0,
+              createdAt:  new Date().toISOString(),
+            };
+          }
+        }),
+      );
     }
   }
 
-  return reports;
+  return Promise.all(tasks);
 }
 
 function expandMatrix(

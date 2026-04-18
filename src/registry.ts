@@ -5,6 +5,8 @@ import { glob } from 'glob';
 import simpleGit from 'simple-git';
 import got from 'got';
 import AdmZip from 'adm-zip';
+import pLimit from 'p-limit';
+import { sanitizeId } from './safety.js';
 import type { ThemeDoctorConfig, ThemeEntry, ResolvedTheme, MatrixConfig } from './types.js';
 
 const DEFAULT_VIEWPORTS = [375, 768, 1440];
@@ -23,20 +25,41 @@ async function isWooTheme(dir: string): Promise<boolean> {
 
 // ─── Git clone / pull ─────────────────────────────────────────────────────────
 
+const ALLOWED_GIT_SCHEMES = ['https:', 'git:', 'ssh:'];
+
 async function ensureGitSource(
   url: string,
   ref: string,
   destDir: string,
 ): Promise<string> {
+  // Validate URL scheme to prevent cloning from unexpected sources
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    // Allow SSH shorthand like git@github.com:org/repo.git
+    if (!/^[a-zA-Z0-9_\-]+@[a-zA-Z0-9_\-.]+:[a-zA-Z0-9_\-./]+\.git$/.test(url)) {
+      throw new Error(`Invalid git URL: ${url}`);
+    }
+    parsed = { protocol: 'ssh:' } as URL;
+  }
+  if (!ALLOWED_GIT_SCHEMES.includes(parsed.protocol)) {
+    throw new Error(`Git URL scheme "${parsed.protocol}" is not allowed (use https, git, or ssh): ${url}`);
+  }
+
+  // Sanitize ref to prevent git arg injection
+  const safeRef = ref.replace(/[^a-zA-Z0-9_\-./]/g, '');
+  if (!safeRef) throw new Error(`Invalid git ref: ${ref}`);
+
   const git = simpleGit();
   if (fs.existsSync(path.join(destDir, '.git'))) {
     const repo = simpleGit(destDir);
     await repo.fetch('origin');
-    await repo.checkout(ref);
-    await repo.pull('origin', ref);
+    await repo.checkout(safeRef);
+    await repo.pull('origin', safeRef);
   } else {
     await fsp.mkdir(destDir, { recursive: true });
-    await git.clone(url, destDir, ['--branch', ref, '--depth', '1']);
+    await git.clone(url, destDir, ['--branch', safeRef, '--depth', '1']);
   }
   return destDir;
 }
@@ -44,13 +67,43 @@ async function ensureGitSource(
 // ─── Zip download / extract ───────────────────────────────────────────────────
 
 async function ensureZipSource(url: string, destDir: string): Promise<string> {
+  // Enforce HTTPS to prevent MITM on downloads
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`Zip source URL must use HTTPS (got ${parsed.protocol}): ${url}`);
+  }
+
   await fsp.mkdir(destDir, { recursive: true });
   const zipPath = path.join(destDir, '_download.zip');
-  const response = await got(url, { responseType: 'buffer' });
+
+  const response = await got(url, {
+    responseType:   'buffer',
+    timeout:        { request: 60_000 },
+    followRedirect: true,
+    maxRedirects:   3,
+    retry: {
+      // Pass 14: retry on transient network errors, but never on 4xx
+      limit:   3,
+      methods: ['GET'],
+      statusCodes: [408, 429, 500, 502, 503, 504],
+    },
+  });
   await fsp.writeFile(zipPath, response.body);
+
   const zip = new AdmZip(zipPath);
+  const resolvedDest = path.resolve(destDir);
+
+  // Zip-slip protection: validate every entry before extraction
+  for (const entry of zip.getEntries()) {
+    const entryPath = path.resolve(destDir, entry.entryName);
+    if (!entryPath.startsWith(resolvedDest + path.sep) && entryPath !== resolvedDest) {
+      throw new Error(`Zip slip detected: entry "${entry.entryName}" would escape destination`);
+    }
+  }
+
   zip.extractAllTo(destDir, true);
   await fsp.unlink(zipPath);
+
   // If zip contained a single subfolder, return that
   const entries = await fsp.readdir(destDir);
   if (entries.length === 1) {
@@ -100,26 +153,30 @@ export async function resolveThemeEntry(
 
   const src = entry.source;
 
+  // Sanitize the theme ID — must be done after auto-derivation from path/url
+  const safeThemeId = sanitizeId(entry.id);
+  if (!safeThemeId) throw new Error(`Theme entry has an invalid or empty ID: "${entry.id}"`);
+
   if (src.type === 'path') {
     const resolved = path.isAbsolute(src.path)
       ? src.path
       : path.resolve(configDir, src.path);
     // Resolve symlinks
     const real = fs.existsSync(resolved) ? fs.realpathSync(resolved) : resolved;
-    return [{ ...base, id: entry.id, localPath: real }];
+    return [{ ...base, id: safeThemeId, localPath: real }];
   }
 
   if (src.type === 'git') {
     const ref = src.ref ?? 'main';
-    const dest = path.join(cacheDir, 'sources', entry.id);
+    const dest = path.join(cacheDir, 'sources', safeThemeId);
     const localPath = await ensureGitSource(src.url, ref, dest);
-    return [{ ...base, id: entry.id, localPath }];
+    return [{ ...base, id: safeThemeId, localPath }];
   }
 
   if (src.type === 'zip') {
-    const dest = path.join(cacheDir, 'sources', entry.id);
+    const dest = path.join(cacheDir, 'sources', safeThemeId);
     const localPath = await ensureZipSource(src.url, dest);
-    return [{ ...base, id: entry.id, localPath }];
+    return [{ ...base, id: safeThemeId, localPath }];
   }
 
   if (src.type === 'glob') {
@@ -131,7 +188,9 @@ export async function resolveThemeEntry(
     for (const match of matches) {
       const real = fs.realpathSync(match);
       if (src.detect_woo && !(await isWooTheme(real))) continue;
-      const id = path.basename(real);
+      const rawId = path.basename(real);
+      const id    = sanitizeId(rawId);
+      if (!id) continue;
       themes.push({ ...base, id, localPath: real });
     }
     return themes;
@@ -140,21 +199,29 @@ export async function resolveThemeEntry(
   return [];
 }
 
-// ─── Resolve all themes ───────────────────────────────────────────────────────
+// ─── Resolve all themes (parallel, up to 8 concurrent git/zip ops) ───────────
 
 export async function resolveAllThemes(
   config: ThemeDoctorConfig,
   configDir: string,
   cacheDir: string,
 ): Promise<ResolvedTheme[]> {
+  const limit = pLimit(8);
+
+  const nested = await Promise.all(
+    config.themes.map(entry => limit(() => resolveThemeEntry(entry, config, configDir, cacheDir))),
+  );
+
   const all: ResolvedTheme[] = [];
-  for (const entry of config.themes) {
-    const resolved = await resolveThemeEntry(entry, config, configDir, cacheDir);
+  const seenIds = new Set<string>();
+
+  for (const resolved of nested) {
     for (const t of resolved) {
-      if (all.some(x => x.id === t.id)) {
+      if (seenIds.has(t.id)) {
         console.warn(`[registry] Duplicate theme id "${t.id}" — skipping second occurrence.`);
         continue;
       }
+      seenIds.add(t.id);
       all.push(t);
     }
   }

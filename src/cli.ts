@@ -12,13 +12,14 @@ import { findConfigFile, loadConfig, resolveConfigDir } from './config.js';
 import { resolveAllThemes } from './registry.js';
 import { classifyTheme } from './classifier.js';
 import { runAll } from './orchestrator.js';
-import { resetBreaker, readBreaker } from './safety.js';
+import { resetBreaker, readBreaker, sanitizeId } from './safety.js';
 import { buildDashboard, notifySlack } from './report.js';
 import { judgePacket } from './judge.js';
 import { loadRubric } from './rubric.js';
 import { initWorkspace } from './init.js';
-import { nanoid } from './util.js';
-import type { ThemeDoctorConfig, ThemeEntry } from './types.js';
+import { nanoid, setDebugMode, formatError } from './util.js';
+import type { ThemeDoctorConfig, ThemeEntry, EvidencePacket, RunJudgement } from './types.js';
+import { z } from 'zod';
 
 const execFileAsync = promisify(execFile);
 
@@ -51,7 +52,32 @@ program
   .name('theme-doctor')
   .description('AI-powered WooCommerce theme QA — crawl, judge, and auto-fix any registered theme set.')
   .version('0.1.0')
-  .option('--config <path>', 'Path to theme-doctor.yaml');
+  .option('--config <path>', 'Path to theme-doctor.yaml')
+  .option('--debug', 'Show full stack traces on error');   // Pass 22
+
+// Pass 18: Graceful shutdown — track active cleanup tasks
+const activeCleanupTasks: Array<() => Promise<void>> = [];
+
+function registerCleanup(fn: () => Promise<void>): void {
+  activeCleanupTasks.push(fn);
+}
+
+async function runCleanup(): Promise<void> {
+  await Promise.allSettled(activeCleanupTasks.map(fn => fn()));
+}
+
+process.on('SIGINT',  async () => { await runCleanup(); process.exit(130); });
+process.on('SIGTERM', async () => { await runCleanup(); process.exit(143); });
+process.on('uncaughtException', async (err) => {
+  console.error(chalk.red(`Uncaught exception: ${err.message}`));
+  await runCleanup();
+  process.exit(1);
+});
+process.on('unhandledRejection', async (reason) => {
+  console.error(chalk.red(`Unhandled rejection: ${String(reason)}`));
+  await runCleanup();
+  process.exit(1);
+});
 
 // ─── init ─────────────────────────────────────────────────────────────────────
 
@@ -103,9 +129,39 @@ program
       return;
     }
 
-    config.themes.push({ id, source });
+    // Bug fix: instead of re-serialising the whole config (which strips comments),
+    // append a YAML block for the new theme entry at the end of the existing file.
+    // This preserves all user comments and hand-crafted formatting.
     const { stringify } = await import('yaml');
-    await fsp.writeFile(configFile, stringify(config, { lineWidth: 120 }));
+    const newEntryYaml = stringify([{ id, source }], { lineWidth: 120 }).trimEnd();
+    // The config file already has a `themes:` key. Find the end of the themes list
+    // and splice in — but the safest approach is to append using a raw text strategy:
+    // We append the theme block as an indented list item to avoid full re-parse.
+    const existingContent = await fsp.readFile(configFile, 'utf8');
+    const { atomicWriteFile: atomicWrite } = await import('./util.js');
+
+    if (/^themes:\s*\[\s*\]/m.test(existingContent)) {
+      // themes: [] — replace inline empty array with a block list
+      const indentedEntry = newEntryYaml.replace(/^/gm, '  ').trimEnd();
+      const updated = existingContent.replace(/^themes:\s*\[\s*\]/m, `themes:\n${indentedEntry}`);
+      await atomicWrite(configFile, updated);
+    } else if (/^themes:/m.test(existingContent)) {
+      // themes: already a block — append new entry
+      const indentedEntry = '\n' + newEntryYaml.replace(/^/gm, '  ').trimEnd();
+      // Insert after the last non-empty themes line
+      const updated = existingContent.replace(/(^themes:[\s\S]*?)(\n^[^\s\n])/m, `$1${indentedEntry}$2`);
+      if (updated === existingContent) {
+        // themes: was at EOF — just append
+        await atomicWrite(configFile, existingContent.trimEnd() + indentedEntry + '\n');
+      } else {
+        await atomicWrite(configFile, updated);
+      }
+    } else {
+      // No themes key found — fall back to full re-serialize (config was likely hand-edited)
+      config.themes.push({ id, source });
+      await atomicWrite(configFile, stringify(config, { lineWidth: 120 }));
+    }
+
     console.log(chalk.green(`Added theme "${id}".`));
   });
 
@@ -189,6 +245,16 @@ program
 
     const spinner = ora(`Running Theme Doctor on ${themes.length} theme(s)…`).start();
 
+    // Pass 22: enable debug mode as early as possible
+    if (program.opts().debug) setDebugMode(true);
+
+    // Pass 11: validate --sandbox value
+    const VALID_SANDBOXES = ['playground', 'wp-env', 'auto'] as const;
+    if (opts.sandbox && !(VALID_SANDBOXES as readonly string[]).includes(opts.sandbox)) {
+      console.error(chalk.red(`Invalid --sandbox value "${opts.sandbox}". Must be one of: ${VALID_SANDBOXES.join(', ')}`));
+      process.exit(1);
+    }
+
     try {
       const reports = await runAll(themes, {
         configDir,
@@ -224,8 +290,11 @@ program
       if (slackWebhook) {
         await notifySlack(slackWebhook, reports).catch(() => undefined);
       }
+      // Pass 11: exit non-zero when any run has a non-pass verdict
+      if (fail > 0) process.exitCode = 1;
+
     } catch (err: unknown) {
-      spinner.fail(chalk.red(err instanceof Error ? err.message : String(err)));
+      spinner.fail(chalk.red(formatError(err)));
       process.exit(1);
     }
   });
@@ -263,6 +332,8 @@ program
       });
 
       const boot = await sandbox.boot(theme, cell);
+      // Pass 18: register cleanup so Ctrl+C shuts down the sandbox
+      registerCleanup(() => boot.shutdown().catch(() => undefined));
       const rubric = await loadRubric(configDir);
       const ctx = {
         runId,
@@ -301,14 +372,39 @@ program
   .description('Re-judge an existing crawl run (no re-crawl)')
   .action(async (runId: string) => {
     const { configDir } = requireConfig(program.opts().config);
-    const evidencePath = path.join(configDir, 'reports', runId, 'evidence.json');
-    if (!fs.existsSync(evidencePath)) {
-      console.error(chalk.red(`No evidence packet found for run "${runId}".`));
+
+    // Pass 11: sanitize runId before using in file paths
+    const safeRunId = sanitizeId(runId);
+    if (!safeRunId) {
+      console.error(chalk.red(`Invalid run ID: "${runId}"`));
       process.exit(1);
     }
 
-    const spinner = ora(`Judging run ${runId}…`).start();
-    const packet  = JSON.parse(await fsp.readFile(evidencePath, 'utf8'));
+    const evidencePath = path.join(configDir, 'reports', safeRunId, 'evidence.json');
+    if (!fs.existsSync(evidencePath)) {
+      console.error(chalk.red(`No evidence packet found for run "${safeRunId}".`));
+      process.exit(1);
+    }
+
+    const spinner = ora(`Judging run ${safeRunId}…`).start();
+
+    // Pass 19: validate loaded evidence packet structure
+    let packet: EvidencePacket;
+    try {
+      const raw = JSON.parse(await fsp.readFile(evidencePath, 'utf8'));
+      const EvidencePacketSchema = z.object({
+        runId:     z.string(),
+        themeId:   z.string(),
+        matrix:    z.object({ wp: z.string(), wc: z.string(), php: z.string() }),
+        captures:  z.array(z.object({ templateId: z.string() }).passthrough()),
+        createdAt: z.string(),
+      });
+      packet = EvidencePacketSchema.parse(raw) as unknown as EvidencePacket;
+    } catch (err) {
+      spinner.fail(chalk.red(`Invalid evidence packet: ${formatError(err)}`));
+      process.exit(1);
+    }
+
     const rubric  = await loadRubric(configDir);
     const result  = await judgePacket(packet, configDir, rubric);
 
@@ -318,7 +414,7 @@ program
       console.log(`  ❌ ${v.templateId}@${v.viewport}px — ${v.verdict} [${v.tier}]: ${v.evidence.join('; ')}`);
     }
 
-    const outPath = path.join(configDir, 'reports', runId, 'judgement.json');
+    const outPath = path.join(configDir, 'reports', safeRunId, 'judgement.json');
     await fsp.writeFile(outPath, JSON.stringify(result, null, 2));
     console.log(chalk.dim(`Judgement saved to ${outPath}`));
   });
@@ -338,16 +434,29 @@ program
       process.exit(1);
     }
 
-    // Find latest judgement for this theme
+    // Pass 11 + 19: find latest judgement, cap scan, validate JSON
     const reportsDir = path.join(configDir, 'reports');
-    let latestJudgement = null;
+    let latestJudgement: RunJudgement | null = null;
     if (fs.existsSync(reportsDir)) {
-      const runs = (await fsp.readdir(reportsDir)).sort().reverse();
+      const runs = (await fsp.readdir(reportsDir))
+        .filter(r => /^[a-zA-Z0-9_\-]+$/.test(r)) // safe dir names only
+        .sort().reverse()
+        .slice(0, 200); // cap scan depth
+
       for (const run of runs) {
         const jp = path.join(reportsDir, run, 'judgement.json');
         if (fs.existsSync(jp)) {
-          const j = JSON.parse(await fsp.readFile(jp, 'utf8'));
-          if (j.themeId === id) { latestJudgement = j; break; }
+          try {
+            const raw = JSON.parse(await fsp.readFile(jp, 'utf8'));
+            const RunJudgementSchema = z.object({
+              themeId:        z.string(),
+              runId:          z.string(),
+              overallVerdict: z.string(),
+              verdicts:       z.array(z.object({ verdict: z.string(), templateId: z.string() }).passthrough()),
+            }).passthrough();
+            const parsed = RunJudgementSchema.parse(raw) as unknown as RunJudgement;
+            if (parsed.themeId === id) { latestJudgement = parsed; break; }
+          } catch { /* skip corrupted */ }
         }
       }
     }
@@ -418,6 +527,8 @@ program
     const cell = { wp: theme.matrix.wp[0]!, wc: theme.matrix.wc[0]!, php: theme.matrix.php[0]! };
     const sandbox = await createSandbox(theme, cell, { configDir, blueprintPath, workDir });
     const boot = await sandbox.boot(theme, cell);
+    // Pass 18: register cleanup
+    registerCleanup(() => boot.shutdown().catch(() => undefined));
 
     const reproRubric = {
       templates: [{
@@ -488,13 +599,22 @@ goldensCmd
   .description('Mark pending goldens as approved for a theme')
   .action(async (id: string) => {
     const { configDir } = requireConfig(program.opts().config);
-    const pendingPath = path.join(configDir, 'goldens', id, '.pending');
-    if (!fs.existsSync(pendingPath)) {
-      console.log(chalk.yellow(`No pending goldens for "${id}".`));
+    // Bug fix: sanitize id before using in path to prevent path traversal
+    const safeId = id.replace(/[^a-zA-Z0-9_\-]/g, '_').slice(0, 64);
+    if (safeId !== id) {
+      console.error(chalk.red(`Invalid theme ID "${id}".`));
+      process.exitCode = 1;
+      return;
+    }
+    const pendingPath = path.join(configDir, 'goldens', safeId, '.pending');
+    try {
+      await fsp.access(pendingPath);
+    } catch {
+      console.log(chalk.yellow(`No pending goldens for "${safeId}".`));
       return;
     }
     await fsp.unlink(pendingPath);
-    console.log(chalk.green(`Goldens approved for "${id}".`));
+    console.log(chalk.green(`Goldens approved for "${safeId}".`));
   });
 
 goldensCmd
@@ -503,14 +623,24 @@ goldensCmd
   .action(async () => {
     const { configDir } = requireConfig(program.opts().config);
     const goldensDir = path.join(configDir, 'goldens');
-    if (!fs.existsSync(goldensDir)) {
+    try {
+      await fsp.access(goldensDir);
+    } catch {
       console.log('No goldens yet.');
       return;
     }
-    const themes = await fsp.readdir(goldensDir);
-    for (const t of themes) {
-      const matrixDirs = await fsp.readdir(path.join(goldensDir, t));
-      console.log(`  ${t}: ${matrixDirs.join(', ')}`);
+    const entries = await fsp.readdir(goldensDir, { withFileTypes: true });
+    // Bug fix: only descend into actual directories; skip files like .gitkeep
+    const themeDirs = entries.filter(e => e.isDirectory());
+    if (themeDirs.length === 0) {
+      console.log('No goldens yet.');
+      return;
+    }
+    for (const t of themeDirs) {
+      const matrixEntries = await fsp.readdir(path.join(goldensDir, t.name), { withFileTypes: true })
+        .catch(() => []);
+      const matrixDirs = matrixEntries.filter(e => e.isDirectory()).map(e => e.name);
+      console.log(`  ${t.name}: ${matrixDirs.length ? matrixDirs.join(', ') : '(no matrix dirs)'}`);
     }
   });
 
@@ -600,7 +730,10 @@ program
     }
   });
 
+// Pass 22: activate debug mode before parsing so all commands can check it
+if (process.argv.includes('--debug')) setDebugMode(true);
+
 program.parseAsync(process.argv).catch(err => {
-  console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+  console.error(chalk.red(formatError(err)));
   process.exit(1);
 });

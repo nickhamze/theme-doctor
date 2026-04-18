@@ -1,26 +1,30 @@
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
 import type { ThemeDoctorConfig, ThemeEntry, Defaults } from './types.js';
 
-// ─── Zod schemas ─────────────────────────────────────────────────────────────
+// ─── Pass 12: Stricter Zod schemas ────────────────────────────────────────────
 
-const SourcePathSchema = z.object({ type: z.literal('path'), path: z.string() });
-const SourceGitSchema  = z.object({ type: z.literal('git'),  url: z.string(), ref: z.string().optional() });
-const SourceZipSchema  = z.object({ type: z.literal('zip'),  url: z.string() });
-const SourceGlobSchema = z.object({ type: z.literal('glob'), pattern: z.string(), detect_woo: z.boolean().optional() });
+// Safe version string: only digits, dots, and the literal "latest"
+const VersionStringSchema = z.string().trim().regex(/^(?:latest|[0-9]+(?:\.[0-9]+)*)$/, 'Must be "latest" or a version like "6.7"');
+
+const SourcePathSchema = z.object({ type: z.literal('path'), path: z.string().min(1).max(4096) });
+const SourceGitSchema  = z.object({ type: z.literal('git'),  url: z.string().url().max(2048), ref: z.string().max(256).optional() });
+const SourceZipSchema  = z.object({ type: z.literal('zip'),  url: z.string().url().max(2048) });
+const SourceGlobSchema = z.object({ type: z.literal('glob'), pattern: z.string().min(1).max(4096), detect_woo: z.boolean().optional() });
 const SourceSchema = z.discriminatedUnion('type', [SourcePathSchema, SourceGitSchema, SourceZipSchema, SourceGlobSchema]);
 
 const MatrixSchema = z.object({
-  wp:  z.array(z.string()).optional(),
-  wc:  z.array(z.string()).optional(),
-  php: z.array(z.string()).optional(),
+  wp:  z.array(VersionStringSchema).max(10).optional(),
+  wc:  z.array(VersionStringSchema).max(10).optional(),
+  php: z.array(VersionStringSchema).max(10).optional(),
 });
 
 const DefaultsSchema = z.object({
-  branch:    z.string().optional(),
-  viewports: z.array(z.number()).optional(),
+  branch:    z.string().trim().max(256).optional(),
+  viewports: z.array(z.number().int().min(320).max(3840)).max(10).optional(),
   matrix:    MatrixSchema.optional(),
   sandbox:   z.enum(['playground', 'wp-env', 'auto']).optional(),
   pr: z.object({
@@ -28,29 +32,30 @@ const DefaultsSchema = z.object({
     auto_merge_cosmetic: z.boolean().optional(),
   }).optional(),
   budget: z.object({
-    max_cost_usd_per_run: z.number().optional(),
+    max_cost_usd_per_run: z.number().positive().max(100).optional(),
   }).optional(),
 }).optional();
 
 const ThemeEntrySchema = z.object({
-  id:         z.string().optional(),
+  id:         z.string().trim().min(1).max(128).optional(),
   source:     SourceSchema,
-  repo:       z.string().optional(),
-  owner:      z.string().optional(),
-  branch:     z.string().optional(),
-  viewports:  z.array(z.number()).optional(),
+  repo:       z.string().trim().max(512).optional(),
+  owner:      z.string().trim().max(256).optional(),
+  branch:     z.string().trim().max(256).optional(),
+  viewports:  z.array(z.number().int().min(320).max(3840)).max(10).optional(),
   matrix:     MatrixSchema.optional(),
   sandbox:    z.enum(['playground', 'wp-env', 'auto']).optional(),
   detect_woo: z.boolean().optional(),
 });
 
 const ConfigSchema = z.object({
-  version:      z.number(),
+  // Pass 12: enforce exact supported version
+  version:      z.number().int().min(1).max(1),
   defaults:     DefaultsSchema,
-  themes:       z.array(ThemeEntrySchema),
+  themes:       z.array(ThemeEntrySchema).min(0).max(200),
   integrations: z.object({
-    slack:     z.object({ webhook_url_env: z.string() }).optional(),
-    dashboard: z.object({ publish: z.string().optional(), repo: z.string().optional() }).optional(),
+    slack:     z.object({ webhook_url_env: z.string().trim().max(128) }).optional(),
+    dashboard: z.object({ publish: z.string().max(512).optional(), repo: z.string().max(512).optional() }).optional(),
   }).optional(),
 });
 
@@ -70,8 +75,24 @@ export function findConfigFile(startDir: string = process.cwd()): string | null 
 }
 
 export function loadConfig(configPath: string): ThemeDoctorConfig {
-  const raw = fs.readFileSync(configPath, 'utf8');
-  const parsed = parseYaml(raw);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(configPath, 'utf8');
+  } catch (err: unknown) {
+    throw new Error(`Cannot read config file "${configPath}": ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  let parsed: unknown;
+  try {
+    // Pass 12: yaml.parse is safe against circular references in this library
+    parsed = parseYaml(raw);
+  } catch (err: unknown) {
+    throw new Error(`Invalid YAML in "${configPath}": ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`"${configPath}" must be a YAML mapping, not a scalar or array`);
+  }
 
   const result = ConfigSchema.safeParse(parsed);
   if (!result.success) {
@@ -86,10 +107,10 @@ export function loadConfig(configPath: string): ThemeDoctorConfig {
     const source = t.source as ThemeEntry['source'];
     let id = t.id;
     if (!id) {
-      if (source.type === 'path')   id = path.basename(source.path);
-      else if (source.type === 'git') id = path.basename(source.url, '.git');
-      else if (source.type === 'zip') id = path.basename(new URL(source.url).pathname, '.zip');
-      else id = `theme-${idx}`;
+      if (source.type === 'path')        id = path.basename(source.path);
+      else if (source.type === 'git')    id = path.basename(source.url, '.git');
+      else if (source.type === 'zip')    id = path.basename(new URL(source.url).pathname, '.zip');
+      else                               id = `theme-${idx}`;
     }
     return { ...t, id, source } as ThemeEntry;
   });
@@ -100,6 +121,13 @@ export function loadConfig(configPath: string): ThemeDoctorConfig {
     themes,
     integrations: data.integrations,
   };
+}
+
+/** Async version of loadConfig for non-CLI contexts */
+export async function loadConfigAsync(configPath: string): Promise<ThemeDoctorConfig> {
+  // Verify the file exists and is readable before calling the sync version
+  await fsp.access(configPath);
+  return loadConfig(configPath);
 }
 
 export function resolveConfigDir(configPath: string): string {

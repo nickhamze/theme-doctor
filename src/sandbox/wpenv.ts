@@ -2,6 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import type { ResolvedTheme } from '../types.js';
 import type { Sandbox, SandboxOptions, SandboxBootResult } from './types.js';
 
@@ -21,9 +22,11 @@ export class WpEnvSandbox implements Sandbox {
     const matrix = _matrix;
 
     // Write .wp-env.json into a temp work dir
+    // Pass 7: use cryptographically random suffix to prevent collisions in parallel runs
+    const uid = crypto.randomBytes(6).toString('hex');
     const workDir = path.join(
       this.options.workDir ?? '/tmp',
-      `wpenv-${theme.id}-${Date.now()}`,
+      `wpenv-${theme.id}-${uid}`,
     );
     await fsp.mkdir(workDir, { recursive: true });
 
@@ -76,11 +79,15 @@ export class WpEnvSandbox implements Sandbox {
 
     const phpLogPath = path.join(workDir, 'wordpress', 'wp-content', 'debug.log');
 
+    // Pass 7 + 25: idempotent shutdown
+    let shutdownCalled = false;
     const shutdown = async () => {
+      if (shutdownCalled) return;
+      shutdownCalled = true;
       try {
         await execFileAsync(wpEnvBin, ['stop'], { cwd: workDir });
       } finally {
-        await fsp.rm(workDir, { recursive: true, force: true });
+        await fsp.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
       }
     };
 

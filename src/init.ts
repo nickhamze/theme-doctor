@@ -2,6 +2,7 @@ import fsp from 'node:fs/promises';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { atomicWriteFile } from './util.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULTS_DIR = path.resolve(__dirname, '..', 'defaults');
@@ -71,15 +72,15 @@ reports/
 export async function initWorkspace(dir: string, opts: { force: boolean }): Promise<void> {
   const configPath = path.join(dir, 'theme-doctor.yaml');
 
-  // Write main config
+  // Bug fix: use atomic write so a crash mid-init doesn't corrupt the config
   if (!fs.existsSync(configPath) || opts.force) {
-    await fsp.writeFile(configPath, DEFAULT_CONFIG);
+    await atomicWriteFile(configPath, DEFAULT_CONFIG);
   }
 
   // Write .gitignore addition
   const gitignorePath = path.join(dir, '.theme-doctor-gitignore');
   if (!fs.existsSync(gitignorePath) || opts.force) {
-    await fsp.writeFile(gitignorePath, GITIGNORE_CONTENT);
+    await atomicWriteFile(gitignorePath, GITIGNORE_CONTENT);
   }
 
   // Copy default rubric files
@@ -122,19 +123,17 @@ async function writeFallbackDefaults(dir: string, force: boolean): Promise<void>
 
   const tplPath = path.join(rubricDir, 'templates.yaml');
   if (!fs.existsSync(tplPath) || force) {
-    // The full default is in defaults/rubric/templates.yaml; if that's missing
-    // (dev environment without a build) write a minimal starter.
-    await fsp.writeFile(tplPath, FALLBACK_TEMPLATES_YAML);
+    await atomicWriteFile(tplPath, FALLBACK_TEMPLATES_YAML);
   }
 
   const flowPath = path.join(rubricDir, 'flows.yaml');
   if (!fs.existsSync(flowPath) || force) {
-    await fsp.writeFile(flowPath, FALLBACK_FLOWS_YAML);
+    await atomicWriteFile(flowPath, FALLBACK_FLOWS_YAML);
   }
 
   const bpPath = path.join(blueprintDir, 'base.json');
   if (!fs.existsSync(bpPath) || force) {
-    await fsp.writeFile(bpPath, FALLBACK_BLUEPRINT_JSON);
+    await atomicWriteFile(bpPath, FALLBACK_BLUEPRINT_JSON);
   }
 }
 

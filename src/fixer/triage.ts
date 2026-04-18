@@ -3,9 +3,24 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 import simpleGit from 'simple-git';
+import { z } from 'zod';
 import type { RunJudgement, TriagePlan, RiskClass } from '../types.js';
 import { getRecentHumanModifiedFiles } from '../safety.js';
 import { appendAuditLog } from '../safety.js';
+import { redactSecrets } from '../util.js';
+
+// ─── Pass 19: Zod schema for LLM triage response ─────────────────────────────
+
+const TriageResponseSchema = z.object({
+  hypothesis:        z.string().max(2000),
+  filesToTouch:      z.array(z.object({
+    relativePath:    z.string().max(512),
+    reason:          z.string().max(500),
+    expectedLines:   z.number().int().optional(),
+  })).max(10),
+  riskClass:         z.enum(['cosmetic', 'layout', 'functional']),
+  estimatedDiffSize: z.enum(['tiny', 'small', 'medium', 'large']),
+});
 
 // Resolve the WP template hierarchy for a given template ID
 function wpTemplateFiles(templateId: string): string[] {
@@ -57,7 +72,8 @@ export async function runTriageAgent(
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY is required for triage agent');
 
-  const client = new Anthropic({ apiKey });
+  // Pass 14: configure explicit retry for transient API failures
+  const client = new Anthropic({ apiKey, maxRetries: 3, timeout: 95_000 });
 
   const failingVerdicts = judgement.verdicts.filter(v => v.verdict !== 'pass');
   const affectedTemplates = [...new Set(failingVerdicts.map(v => v.templateId))];
@@ -108,17 +124,23 @@ Rules:
     Object.entries(themeFiles).map(([f, c]) => `### ${f}\n\`\`\`php\n${c.slice(0, 3000)}\n\`\`\``).join('\n\n'),
   ].join('\n');
 
-  const msg = await client.messages.create({
-    model:      'claude-haiku-4-5',
-    max_tokens: 1024,
-    temperature: 0.1,
-    system:     systemPrompt,
-    messages:   [{ role: 'user', content: userContent }],
-  });
+  const msg = await Promise.race([
+    client.messages.create({
+      model:      'claude-haiku-4-5',
+      max_tokens: 1024,
+      temperature: 0.1,
+      system:     systemPrompt,
+      messages:   [{ role: 'user', content: userContent }],
+    }),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Triage LLM timeout (90s)')), 90_000),
+    ),
+  ]);
 
+  // Pass 15: Redact secrets before writing to audit log
   await appendAuditLog(configDir, judgement.themeId, judgement.runId, {
     phase:  'triage',
-    prompt: userContent.slice(0, 500),
+    prompt: redactSecrets(userContent.slice(0, 500)),
     tokens: msg.usage,
   });
 
@@ -127,7 +149,19 @@ Rules:
   let plan: Omit<TriagePlan, 'runId' | 'themeId' | 'humanModifiedFiles' | 'createdAt'>;
 
   try {
-    plan = JSON.parse(jsonMatch?.[0] ?? '{}');
+    // Pass 19: validate with Zod to reject malformed/oversized LLM responses
+    const raw = JSON.parse(jsonMatch?.[0] ?? '{}');
+    const validated = TriageResponseSchema.safeParse(raw);
+    if (validated.success) {
+      plan = validated.data;
+    } else {
+      plan = {
+        hypothesis:        'LLM response failed schema validation.',
+        filesToTouch:      [],
+        riskClass:         'functional' as RiskClass,
+        estimatedDiffSize: 'medium' as const,
+      };
+    }
   } catch {
     plan = {
       hypothesis:        'Unable to determine root cause automatically.',

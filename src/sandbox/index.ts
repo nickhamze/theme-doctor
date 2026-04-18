@@ -11,8 +11,11 @@ export async function createSandbox(
   theme: ResolvedTheme,
   matrix: { wp: string; wc: string; php: string },
   options: SandboxOptions,
+  // Pass 25: allow explicit override from orchestrator (respects per-theme + CLI option)
+  overrideSandbox?: 'playground' | 'wp-env',
 ): Promise<Sandbox> {
-  const mode = theme.sandbox === 'auto' ? detectSandbox() : theme.sandbox;
+  const preferred = overrideSandbox ?? theme.sandbox;
+  const mode = preferred === 'auto' || !preferred ? detectSandbox() : preferred;
 
   if (mode === 'playground') {
     return new PlaygroundSandbox(theme, matrix, options);

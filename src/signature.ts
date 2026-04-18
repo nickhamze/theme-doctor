@@ -40,15 +40,20 @@ export async function computeLayoutSignature(page: Page): Promise<string> {
 
   const tree = await page.evaluate(`(function(){
     var skipTags = ${skipTagsJson};
-    function serialize(el) {
-      var tag = el.tagName.toLowerCase();
-      if (skipTags.indexOf(tag) !== -1) return null;
+    var MAX_DEPTH = 64;    // Bug fix: cap recursion depth to prevent stack overflow
+    var MAX_NODES = 2000;  // Cap total nodes to prevent O(n) blowup on huge pages
+    var nodeCount = 0;
+    function serialize(el, depth) {
+      if (depth > MAX_DEPTH || nodeCount >= MAX_NODES) return null;
+      var tag = el.tagName ? el.tagName.toLowerCase() : '';
+      if (!tag || skipTags.indexOf(tag) !== -1) return null;
       var rect = el.getBoundingClientRect();
       if (rect.width === 0 && rect.height === 0) return null;
+      nodeCount++;
       var role = el.getAttribute('role') || tag;
       var children = [];
       for (var i = 0; i < el.children.length; i++) {
-        var s = serialize(el.children[i]);
+        var s = serialize(el.children[i], depth + 1);
         if (s) children.push(s);
       }
       return {
@@ -60,7 +65,7 @@ export async function computeLayoutSignature(page: Page): Promise<string> {
         children: children
       };
     }
-    return serialize(document.body);
+    return document.body ? serialize(document.body, 0) : null;
   })()`) as BoxNode | null;
 
   const canonical = JSON.stringify(tree);

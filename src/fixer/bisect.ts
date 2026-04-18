@@ -18,7 +18,16 @@ export async function bisectBadCommit(
 ): Promise<string | null> {
   const git = simpleGit(themeDir);
 
-  // Collect commits between good and bad
+  // Validate commit hashes to prevent git arg injection
+  const SHA_RE = /^[0-9a-f]{7,40}$/i;
+  if (!SHA_RE.test(goodCommit) || !SHA_RE.test(badCommit)) {
+    throw new Error(`bisectBadCommit: invalid commit hash (must be hex SHA)`);
+  }
+
+  // Record current HEAD so we can restore it even on failure
+  const originalRef = await git.revparse(['HEAD']).catch(() => badCommit);
+
+  // Collect commits between good and bad using range syntax
   const log = await git.log({ from: goodCommit, to: badCommit });
   const commits = log.all.map(c => c.hash);
 
@@ -28,27 +37,27 @@ export async function bisectBadCommit(
   let hi = commits.length - 1;
   let firstBad: string | null = badCommit;
 
-  while (lo < hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    const hash = commits[mid]!;
+  try {
+    while (lo < hi) {
+      const mid  = Math.floor((lo + hi) / 2);
+      const hash = commits[mid]!;
 
-    // Checkout midpoint
-    await git.checkout(hash);
+      await git.checkout(hash);
 
-    // Run a quick crawl + judge
-    const packet   = await crawlTheme(ctx, sandbox, rubric, ctx.theme.viewports);
-    const judgement = await judgePacket(packet, ctx.configDir, rubric);
+      const packet    = await crawlTheme(ctx, sandbox, rubric, ctx.theme.viewports);
+      const judgement = await judgePacket(packet, ctx.configDir, rubric);
 
-    if (judgement.overallVerdict === 'pass') {
-      lo = mid + 1; // bug was introduced after mid
-    } else {
-      firstBad = hash;
-      hi = mid;     // bug may have been introduced at or before mid
+      if (judgement.overallVerdict === 'pass') {
+        lo = mid + 1;
+      } else {
+        firstBad = hash;
+        hi = mid;
+      }
     }
+  } finally {
+    // Bug fix: always restore to original ref, even if bisect throws
+    await git.checkout(originalRef).catch(() => undefined);
   }
-
-  // Restore to HEAD
-  await git.checkout('HEAD');
 
   return firstBad;
 }
