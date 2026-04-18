@@ -1,0 +1,55 @@
+{
+  "$schema": "https://playground.wordpress.net/blueprint-schema.json",
+  "landingPage": "/wp-admin/",
+  "preferredVersions": {
+    "php": "8.2",
+    "wp": "latest"
+  },
+  "phpExtensionBundles": ["kitchen-sink"],
+  "features": {
+    "networking": false
+  },
+  "steps": [
+    {
+      "step": "login",
+      "username": "admin",
+      "password": "password"
+    },
+    {
+      "step": "installPlugin",
+      "pluginData": {
+        "resource": "wordpress.org/plugins",
+        "slug": "woocommerce"
+      }
+    },
+    {
+      "step": "activatePlugin",
+      "pluginPath": "/wordpress/wp-content/plugins/woocommerce"
+    },
+    {
+      "step": "writeFile",
+      "path": "/wordpress/wp-content/themes/theme-doctor-freeze.css",
+      "data": "*, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; caret-color: transparent !important; }"
+    },
+    {
+      "step": "runPHP",
+      "code": "<?php\nrequire '/wordpress/wp-load.php';\n\n// Configure WooCommerce store\nupdate_option('woocommerce_store_address', '123 Main St');\nupdate_option('woocommerce_store_city', 'Springfield');\nupdate_option('woocommerce_default_country', 'US:IL');\nupdate_option('woocommerce_store_postcode', '62701');\nupdate_option('woocommerce_currency', 'USD');\nupdate_option('woocommerce_product_type', 'both');\nupdate_option('woocommerce_allow_tracking', 'no');\nupdate_option('woocommerce_enable_signup_and_login_from_checkout', 'yes');\nupdate_option('woocommerce_enable_myaccount_registration', 'yes');\n\n// Create required pages\nWC_Install::create_pages();\n\n// Create blog page\n$blog_page_id = wp_insert_post([\n  'post_title' => 'Blog',\n  'post_name' => 'blog',\n  'post_status' => 'publish',\n  'post_type' => 'page',\n]);\nupdate_option('page_for_posts', $blog_page_id);\n\necho 'WooCommerce store configured.';\n?>"
+    },
+    {
+      "step": "runPHP",
+      "code": "<?php\nrequire '/wordpress/wp-load.php';\n\n// Create a simple test product with predictable ID\n$product = new WC_Product_Simple();\n$product->set_name('Theme Doctor Test Product');\n$product->set_slug('test-product');\n$product->set_regular_price('29.99');\n$product->set_description('<p>A test product used by Theme Doctor for QA verification.</p>');\n$product->set_short_description('QA test product.');\n$product->set_status('publish');\n$product->set_catalog_visibility('visible');\n$product->set_manage_stock(true);\n$product->set_stock_quantity(100);\n$product->set_stock_status('instock');\n$id = $product->save();\n\n// Create a variable product\n$variable = new WC_Product_Variable();\n$variable->set_name('Theme Doctor Variable Product');\n$variable->set_slug('test-variable-product');\n$variable->set_status('publish');\n$variable->set_catalog_visibility('visible');\n$vid = $variable->save();\n\necho \"Products created: simple=$id variable=$vid\";\n?>"
+    },
+    {
+      "step": "runPHP",
+      "code": "<?php\nrequire '/wordpress/wp-load.php';\n\n// Create a test customer account\n$user_id = wp_create_user('testcustomer', 'test-password', 'test@example.com');\nif (!is_wp_error($user_id)) {\n  wp_update_user(['ID' => $user_id, 'role' => 'customer',\n    'first_name' => 'Test', 'last_name' => 'Customer']);\n  update_user_meta($user_id, 'billing_first_name', 'Test');\n  update_user_meta($user_id, 'billing_last_name', 'Customer');\n  update_user_meta($user_id, 'billing_email', 'test@example.com');\n  update_user_meta($user_id, 'billing_address_1', '123 Main St');\n  update_user_meta($user_id, 'billing_city', 'Springfield');\n  update_user_meta($user_id, 'billing_postcode', '62701');\n  update_user_meta($user_id, 'billing_country', 'US');\n  update_user_meta($user_id, 'billing_state', 'IL');\n}\n\n// Enable BACS payment method\nupdate_option('woocommerce_bacs_settings', [\n  'enabled' => 'yes',\n  'title' => 'Direct bank transfer',\n]);\n\necho \"Test customer created: $user_id\";\n?>"
+    },
+    {
+      "step": "runPHP",
+      "code": "<?php\nrequire '/wordpress/wp-load.php';\n\n// Enable WP_DEBUG_LOG\n$wp_config = file_get_contents(ABSPATH . 'wp-config.php');\nif (!str_contains($wp_config, 'WP_DEBUG_LOG')) {\n  define('WP_DEBUG', true);\n  define('WP_DEBUG_LOG', true);\n  define('WP_DEBUG_DISPLAY', false);\n}\n\n// Create empty debug.log\n$log_path = WP_CONTENT_DIR . '/debug.log';\nif (!file_exists($log_path)) {\n  file_put_contents($log_path, '');\n}\n\necho 'Debug log configured.';\n?>"
+    },
+    {
+      "step": "runPHP",
+      "code": "<?php\nrequire '/wordpress/wp-load.php';\n\n// Create a sample blog post\nwp_insert_post([\n  'post_title' => 'Sample Post',\n  'post_name' => 'sample-post',\n  'post_content' => '<p>This is a sample blog post created by Theme Doctor for testing purposes.</p>',\n  'post_status' => 'publish',\n  'post_type' => 'post',\n  'post_author' => 1,\n]);\n\n// Set permalink structure\nglobal $wp_rewrite;\n$wp_rewrite->set_permalink_structure('/%postname%/');\n$wp_rewrite->flush_rules(true);\n\necho 'Blog post created and permalinks set.';\n?>"
+    }
+  ]
+}

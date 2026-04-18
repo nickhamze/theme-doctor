@@ -1,0 +1,71 @@
+# .github/workflows/theme-doctor.yml
+# Theme Doctor — main QA matrix
+# Copy this file to your project's .github/workflows/ to enable CI runs.
+
+name: Theme Doctor
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * *'   # Nightly at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      theme:
+        description: 'Run a specific theme ID (leave empty for all)'
+        required: false
+      sandbox:
+        description: 'Sandbox type (playground | wp-env | auto)'
+        required: false
+        default: 'auto'
+      dry_run:
+        description: 'Dry run — no PRs'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  theme-doctor:
+    name: Theme Doctor (${{ matrix.theme }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        theme: ${{ fromJson(vars.THEME_DOCTOR_THEMES || '["all"]') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install Theme Doctor
+        run: npm install -g theme-doctor
+
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+
+      - name: Run Theme Doctor
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          THEME_FLAG="${{ github.event.inputs.theme || matrix.theme }}"
+          SANDBOX_FLAG="${{ github.event.inputs.sandbox || 'auto' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+
+          CMD="theme-doctor run --sandbox $SANDBOX_FLAG"
+          [ "$THEME_FLAG" != "all" ] && CMD="$CMD --theme $THEME_FLAG"
+          [ "$DRY_RUN" = "true" ]   && CMD="$CMD --dry-run"
+          eval $CMD
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: theme-doctor-reports-${{ matrix.theme }}
+          path: reports/
+          retention-days: 30

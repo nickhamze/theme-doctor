@@ -1,0 +1,122 @@
+# defaults/rubric/templates.yaml
+# Canonical WooCommerce template rubric shipped with Theme Doctor.
+# Override per-theme in rubric/themes/<theme-id>.yaml
+
+- id: home
+  name: Home
+  urlPattern: /
+  selectors:
+    - { selector: "body", required: true, description: "Page body renders" }
+    - { selector: "header, .site-header", required: true, description: "Site header present" }
+    - { selector: "footer, .site-footer", required: true, description: "Site footer present" }
+
+- id: shop
+  name: Shop Archive
+  urlPattern: /shop/
+  selectors:
+    - { selector: ".woocommerce", required: true }
+    - { selector: "ul.products, .woocommerce-loop-product", required: true, description: "Product grid" }
+    - { selector: ".woocommerce-breadcrumb", required: false }
+    - { selector: ".woocommerce-result-count", required: false }
+    - { selector: ".woocommerce-ordering", required: false }
+
+- id: product-category
+  name: Product Category
+  urlPattern: /product-category/uncategorized/
+  selectors:
+    - { selector: ".woocommerce", required: true }
+    - { selector: "ul.products", required: true }
+
+- id: product-simple
+  name: Single Product (Simple)
+  urlPattern: /product/test-product/
+  selectors:
+    - { selector: ".single-product", required: true }
+    - { selector: ".woocommerce-product-gallery, .images", required: true, description: "Product images" }
+    - { selector: ".woocommerce-Price-amount", required: true, description: "Price displays" }
+    - { selector: ".single_add_to_cart_button", required: true, description: "Add to Cart button" }
+    - { selector: ".woocommerce-product-details__short-description", required: false }
+    - { selector: "#tab-description, .woocommerce-Tabs-panel", required: false }
+
+- id: cart-empty
+  name: Cart (Empty)
+  urlPattern: /cart/?empty=1
+  selectors:
+    - { selector: ".woocommerce-cart", required: true }
+    - { selector: ".cart-empty, .woocommerce-info", required: true, description: "Empty cart message" }
+
+- id: cart
+  name: Cart (With Items)
+  urlPattern: /cart/
+  selectors:
+    - { selector: ".woocommerce-cart-form", required: true }
+    - { selector: ".cart_totals", required: true, description: "Cart totals" }
+    - { selector: ".checkout-button", required: true, description: "Proceed to checkout" }
+
+- id: checkout
+  name: Checkout
+  urlPattern: /checkout/
+  selectors:
+    - { selector: ".woocommerce-checkout, .wp-block-woocommerce-checkout", required: true }
+    - { selector: "#billing_first_name, .wc-block-checkout__main", required: true, description: "Billing fields" }
+    - { selector: "#place_order, .wc-block-components-checkout-place-order-button", required: true, description: "Place order button" }
+
+- id: order-received
+  name: Order Received / Thank You
+  urlPattern: /checkout/order-received/
+  selectors:
+    - { selector: ".woocommerce-order, .woocommerce-order-received", required: true }
+    - { selector: ".woocommerce-notice--success, .wc-block-order-confirmation", required: false }
+
+- id: my-account
+  name: My Account (Login)
+  urlPattern: /my-account/
+  selectors:
+    - { selector: ".woocommerce-account, .woocommerce-MyAccount", required: true }
+    - { selector: ".woocommerce-form-login, .wp-block-woocommerce-customer-account", required: true }
+
+- id: my-account-dashboard
+  name: My Account (Dashboard)
+  urlPattern: /my-account/
+  selectors:
+    - { selector: ".woocommerce-MyAccount-navigation", required: true }
+    - { selector: ".woocommerce-MyAccount-content", required: true }
+
+- id: my-account-orders
+  name: My Account (Orders)
+  urlPattern: /my-account/orders/
+  selectors:
+    - { selector: ".woocommerce-MyAccount-navigation", required: true }
+    - { selector: ".woocommerce-orders-table, .woocommerce-info", required: true }
+
+- id: blog
+  name: Blog Index
+  urlPattern: /blog/
+  selectors:
+    - { selector: "article, .hentry", required: true, description: "Blog posts" }
+
+- id: single-post
+  name: Single Post
+  urlPattern: /?p=1
+  selectors:
+    - { selector: "article, .hentry, .post", required: true }
+    - { selector: ".entry-content, .post-content", required: true }
+
+- id: search-with-results
+  name: Search Results (with results)
+  urlPattern: /?s=test
+  selectors:
+    - { selector: ".search-results, .woocommerce", required: true }
+
+- id: search-no-results
+  name: Search Results (no results)
+  urlPattern: /?s=xyzzy-no-results-td
+  selectors:
+    - { selector: ".no-results, .nothing-found, .woocommerce-info", required: true }
+
+- id: "404"
+  name: 404 Not Found
+  urlPattern: /this-page-does-not-exist-theme-doctor/
+  selectors:
+    - { selector: "body", required: true }
+    - { selector: ".error-404, .not-found, h1", required: false }

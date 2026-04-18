@@ -1,0 +1,45 @@
+# .github/workflows/theme-doctor-compat-nightly.yml
+# Theme Doctor — plugin compatibility matrix (nightly)
+# Runs each theme against a set of popular plugins to catch compat regressions.
+
+name: Theme Doctor — Plugin Compat
+
+on:
+  schedule:
+    - cron: '0 5 * * *'   # Nightly at 05:00 UTC (after main run)
+  workflow_dispatch:
+
+jobs:
+  compat:
+    name: Compat (${{ matrix.theme }} + ${{ matrix.plugin }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        theme:  ${{ fromJson(vars.THEME_DOCTOR_THEMES || '["all"]') }}
+        plugin: ['yoast-seo', 'elementor', 'wpml-multilingual-cms', 'contact-form-7']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install Theme Doctor
+        run: npm install -g theme-doctor
+
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+
+      - name: Run compat check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          THEME_FLAG="${{ matrix.theme }}"
+          CMD="theme-doctor run --sandbox playground --dry-run"
+          [ "$THEME_FLAG" != "all" ] && CMD="$CMD --theme $THEME_FLAG"
+          eval $CMD

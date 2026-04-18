@@ -1,0 +1,73 @@
+# defaults/rubric/flows.yaml
+# Multi-step WooCommerce user journey flows shipped with Theme Doctor.
+# Each flow is run at each configured viewport.
+
+- id: purchase-flow
+  name: Purchase flow (simple product → BACS checkout)
+  steps:
+    - { action: navigate, url: /shop/, description: "Land on shop" }
+    - { action: assert, selector: "ul.products .product", description: "Products visible" }
+    - { action: click, selector: "ul.products .product:first-child a.woocommerce-LoopProduct-link", description: "Open first product" }
+    - { action: assert, selector: ".single_add_to_cart_button", description: "Add to Cart visible" }
+    - { action: click, selector: ".single_add_to_cart_button", description: "Add to Cart" }
+    - { action: wait, value: "1500" }
+    - { action: navigate, url: /cart/, description: "Go to cart" }
+    - { action: assert, selector: ".woocommerce-cart-form", description: "Cart form present" }
+    - { action: assert, selector: ".checkout-button", description: "Proceed to checkout visible" }
+    - { action: screenshot, description: "Cart with item" }
+    - { action: click, selector: ".checkout-button", description: "Proceed to checkout" }
+    - { action: assert, selector: "#place_order, .wc-block-components-checkout-place-order-button", description: "Place order button present" }
+    - { action: screenshot, description: "Checkout page" }
+
+- id: variable-product
+  name: Variable product — select variation + add to cart
+  steps:
+    - { action: navigate, url: /shop/, description: "Shop" }
+    - { action: click, selector: ".product_type_variable a", description: "Open variable product" }
+    - { action: assert, selector: ".variations", description: "Variations present" }
+    - { action: select, selector: ".variations select:first-child", value: "1", description: "Select first attribute option" }
+    - { action: wait, value: "500" }
+    - { action: assert, selector: ".single_add_to_cart_button:not(.disabled)", description: "Add to Cart enabled" }
+    - { action: screenshot, description: "Variable product with selection" }
+
+- id: ajax-mini-cart
+  name: AJAX mini-cart update
+  steps:
+    - { action: navigate, url: /shop/, description: "Shop" }
+    - { action: click, selector: ".add_to_cart_button:first-of-type", description: "Add to cart from archive" }
+    - { action: wait, value: "2000" }
+    - { action: assert, selector: ".cart-contents .count, .widget_shopping_cart", description: "Mini-cart updated" }
+    - { action: screenshot, description: "Mini-cart after AJAX add" }
+
+- id: coupon-flow
+  name: Coupon application
+  steps:
+    - { action: navigate, url: /cart/, description: "Cart" }
+    - { action: assert, selector: ".coupon", description: "Coupon field visible" }
+    - { action: fill, selector: "#coupon_code", value: "TESTCOUPON", description: "Enter coupon code" }
+    - { action: click, selector: "[name='apply_coupon']", description: "Apply coupon" }
+    - { action: wait, value: "1500" }
+    - { action: screenshot, description: "Cart after coupon attempt" }
+
+- id: my-account-flow
+  name: My Account — login → orders
+  steps:
+    - { action: navigate, url: /my-account/, description: "My Account login" }
+    - { action: fill, selector: "#username", value: "test@example.com", description: "Enter email" }
+    - { action: fill, selector: "#password", value: "test-password", description: "Enter password" }
+    - { action: click, selector: "[name='login']", description: "Login" }
+    - { action: wait, value: "1500" }
+    - { action: assert, selector: ".woocommerce-MyAccount-navigation", description: "Dashboard visible" }
+    - { action: click, selector: ".woocommerce-MyAccount-navigation-link--orders a", description: "Go to orders" }
+    - { action: assert, selector: ".woocommerce-orders-table, .woocommerce-info", description: "Orders list visible" }
+    - { action: screenshot, description: "My Account orders" }
+
+- id: search-flow
+  name: Header search → results → click result
+  steps:
+    - { action: navigate, url: /, description: "Home" }
+    - { action: click, selector: ".search-toggle, .site-search button, [aria-label='Search']", description: "Open search" }
+    - { action: fill, selector: "input[type='search'], .search-field", value: "test", description: "Type search term" }
+    - { action: click, selector: "[type='submit'], .search-submit", description: "Submit search" }
+    - { action: assert, selector: ".search-results article, .woocommerce ul.products", description: "Results appear" }
+    - { action: screenshot, description: "Search results" }
